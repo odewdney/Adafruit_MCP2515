@@ -159,36 +159,44 @@ int Adafruit_MCP2515::endPacket() {
 
   int n = 0;
 
+	uint8_t buffer[9];
+	uint8_t *buf = &buffer[1];
+	
   if (_txExtended) {
-    writeRegister(REG_TXBnSIDH(n), _txId >> 21);
-    writeRegister(REG_TXBnSIDL(n), (((_txId >> 18) & 0x07) << 5) | FLAG_EXIDE |
-                                       ((_txId >> 16) & 0x03));
-    writeRegister(REG_TXBnEID8(n), (_txId >> 8) & 0xff);
-    writeRegister(REG_TXBnEID0(n), _txId & 0xff);
+    buf[0] = _txId >> 21;
+    buf[1] = (((_txId >> 18) & 0x07) << 5) | FLAG_EXIDE | ((_txId >> 16) & 0x03);
+    buf[2] = (_txId >> 8) & 0xff;
+    buf[3] = _txId & 0xff;
   } else {
-    writeRegister(REG_TXBnSIDH(n), _txId >> 3);
-    writeRegister(REG_TXBnSIDL(n), _txId << 5);
-    writeRegister(REG_TXBnEID8(n), 0x00);
-    writeRegister(REG_TXBnEID0(n), 0x00);
+    buf[0] = _txId >> 3;
+    buf[1] = _txId << 5;
+    buf[2] = 0x00;
+    buf[3] = 0x00;
   }
 
   if (_txRtr) {
-    writeRegister(REG_TXBnDLC(n), 0x40 | _txLength);
-  } else {
-    writeRegister(REG_TXBnDLC(n), _txLength);
+	buf[4] = 0x40 | _txLength;
+	buffer[0] = 0x40 + (n << 1);
+	spi_dev->write(buffer, 6);
 
-    for (int i = 0; i < _txLength; i++) {
-      writeRegister(REG_TXBnD0(n) + i, _txData[i]);
-    }
+  } else {
+    buf[4] = _txLength;
+	buffer[0] = 0x40 + (n << 1);
+	spi_dev->write(buffer, 6);
+
+	memcpy(buf, _txData, _txLength);
+	buffer[0] = 0x41 + (n << 1);
+	spi_dev->write(buffer, _txLength + 1);
   }
 
-  writeRegister(REG_TXBnCTRL(n), 0x08);
+  buffer[0] = 0x80 + (1<<n);
+  spi_dev->write(buffer, 1);
 
   bool aborted = false;
-
-  while (readRegister(REG_TXBnCTRL(n)) & 0x08) {
-    if (readRegister(REG_TXBnCTRL(n)) & 0x10) {
-      // abort
+  uint8_t ctrl;
+  while ((ctrl = readRegister(REG_TXBnCTRL(n))) & 0x08 != 0) {
+    if (ctrl & 0x10) {
+      // errored
       aborted = true;
 
       modifyRegister(REG_CANCTRL, 0x10, 0x10);
@@ -224,23 +232,33 @@ int Adafruit_MCP2515::parsePacket() {
     return 0;
   }
 
-  _rxExtended = (readRegister(REG_RXBnSIDL(n)) & FLAG_IDE) ? true : false;
+  uint8_t buf[5];
+  uint8_t buffer[1] = {0x90 + (n << 2) };
+  spi_dev->write_then_read(buffer, 1, buf, 5);
 
-  uint32_t idA = ((readRegister(REG_RXBnSIDH(n)) << 3) & 0x07f8) |
-                 ((readRegister(REG_RXBnSIDL(n)) >> 5) & 0x07);
+  uint8_t sidh = buf[0]; //readRegister(REG_RXBnSIDH(n)); 
+  uint8_t sidl = buf[1]; // readRegister(REG_RXBnSIDL(n));
+  uint8_t dlc = buf[4]; // readRegister(REG_RXBnDLC(n));
+  
+  _rxExtended = (sidl & FLAG_IDE) ? true : false;
+
+  uint32_t idA = ((sidh << 3) & 0x07f8) |
+                 ((sidl >> 5) & 0x07);
   if (_rxExtended) {
+	  uint8_t eid8 = buf[2]; // readRegister(REG_RXBnEID8(n))
+	  uint8_t eid0 = buf[3]; // readRegister(REG_RXBnEID0(n))
     uint32_t idB =
-        (((uint32_t)(readRegister(REG_RXBnSIDL(n)) & 0x03) << 16) & 0x30000) |
-        ((readRegister(REG_RXBnEID8(n)) << 8) & 0xff00) |
-        readRegister(REG_RXBnEID0(n));
+        (((uint32_t)(sidl & 0x03) << 16) & 0x30000) |
+        ((eid8 << 8) & 0xff00) |
+        eid0;
 
     _rxId = (idA << 18) | idB;
-    _rxRtr = (readRegister(REG_RXBnDLC(n)) & FLAG_RTR) ? true : false;
+    _rxRtr = (dlc & FLAG_RTR) ? true : false;
   } else {
     _rxId = idA;
-    _rxRtr = (readRegister(REG_RXBnSIDL(n)) & FLAG_SRR) ? true : false;
+    _rxRtr = (sidl & FLAG_SRR) ? true : false;
   }
-  _rxDlc = readRegister(REG_RXBnDLC(n)) & 0x0f;
+  _rxDlc = dlc & 0x0f;
   _rxIndex = 0;
 
   if (_rxRtr) {
@@ -248,15 +266,17 @@ int Adafruit_MCP2515::parsePacket() {
   } else {
     _rxLength = _rxDlc;
 
-    for (int i = 0; i < _rxLength; i++) {
-      _rxData[i] = readRegister(REG_RXBnD0(n) + i);
-    }
+	if (_rxLength > 0) {
+		buffer[0] = 0x92 + (n<<2);
+		spi_dev->write_then_read(buffer, 1, _rxData, _rxLength);
+	}
   }
 
   modifyRegister(REG_CANINTF, FLAG_RXnIF(n), 0x00);
 
   return _rxDlc;
 }
+
 
 void Adafruit_MCP2515::onReceive(int intPin, void (*callback)(int)) {
   CANControllerClass::onReceive(callback);
